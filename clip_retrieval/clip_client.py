@@ -29,6 +29,7 @@ class ClipClient:
         deduplicate: bool = True,
         use_safety_model: bool = True,
         use_violence_detector: bool = True,
+        num_result_ids: int = None,
     ):
         """
         url: (required) URL of the backend.
@@ -52,6 +53,7 @@ class ClipClient:
         self.deduplicate = deduplicate
         self.use_safety_model = use_safety_model
         self.use_violence_detector = use_violence_detector
+        self.num_result_ids = num_result_ids if num_result_ids is not None else num_images
 
     def query(
         self,
@@ -145,8 +147,7 @@ class ClipClient:
                     "aesthetic_weight": self.aesthetic_weight,
                     "modality": self.modality,
                     "num_images": self.num_images,
-                    # num_results_ids is hardcoded to the num_images parameter.
-                    "num_result_ids": self.num_images,
+                    "num_result_ids": self.num_result_ids,
                 }
             ),
         ).json()
