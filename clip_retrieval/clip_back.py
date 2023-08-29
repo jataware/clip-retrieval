@@ -16,8 +16,13 @@ import fire
 import base64
 import urllib
 import numpy as np
+from tqdm import tqdm
+import pyarrow as pa
+from pyarrow.ipc import RecordBatchFileReader
+
 from PIL import Image
 from io import BytesIO
+from pathlib import Path
 
 from flask import Flask, request
 from flask_restful import Resource, Api
@@ -112,35 +117,13 @@ def download_img(url):
 class KNNService(Resource):
     """the knn service provides nearest neighbors given text or image"""
 
-    def __init__(self, model, index, meta, cols, device):
+    def __init__(self, model, index, meta, device):
         super().__init__()
 
-        self.model = model
-        self.index = index
-        
-        self.meta  = meta
-        self.cols  = cols
-        
-        
+        self.model  = model
+        self.index  = index
+        self.meta   = meta
         self.device = device
-    
-    # def map_to_metadata(self, indices, distances, n_imgs):
-
-    #     results = []
-    #     metas   = self.meta.get(indices[:n_imgs], self.cols)
-        
-    #     for key, (d, i) in enumerate(zip(distances, indices)):
-    #         output = {}
-    #         meta   = None if key + 1 > len(metas) else metas[key]
-    
-    #         if meta is not None:
-    #             output.update(meta_to_dict(meta))
-            
-    #         output["id"]         = i.item()
-    #         output["similarity"] = d.item()
-    #         results.append(output)
-
-    #     return results
 
     def post(self):
         req = request.get_json(force=True)
@@ -148,21 +131,21 @@ class KNNService(Resource):
         # --
         # Parse req + load image, if appropriate
         
-        q_text = req.get("text", None)
-        q_emb  = req.get("emb",  None)
-        n_imgs = req["n_imgs"]
-        n_mids = req.get("n_mids", n_imgs)
+        q_text      = req.get("text", None)
+        q_emb       = req.get("emb",  None)
+        n_imgs      = req["n_imgs"]
+        n_meta      = req.get("n_meta", n_imgs)
+        return_embs = req.get("return_embs", False)
         
+        # fetch image (maybe)
         if req.get("img", None) is not None:
             q_img = BytesIO(base64.b64decode(req['img']))
         elif req.get("img_url", None) is not None:
             q_img = download_img(req['img_url'])
         else:
             q_img = None
-
-        # --
-        # Compute query
         
+        # compute query
         if q_text is not None and q_text != "":
             inp = self.model.tokenizer([q_text]).to(self.device)
             q   = self.model.encode_text(inp)
@@ -179,80 +162,62 @@ class KNNService(Resource):
         elif q_emb is not None:
             q = np.array(q_emb).astype(np.float32)[None]
         
-        # --
-        # KNN Search
-        
-        D, I, E = self.index.search_and_reconstruct(q, n_mids) # !! could run multiple at a time
+        # do search
+        D, I, E = self.index.search_and_reconstruct(q, n_imgs) # !! could run multiple at a time
         D, I, E = D[0], I[0], E[0]
         
         # drop missing entries
         sel     = I != -1
         D, I, E = D[sel], I[sel], E[sel]
-
-        # --
-        # Post-filter
-                
+        
         # !! deduplicate? (if so, remember to normalize E)
         # !! safety filters, etc?
         
-        if len(D) == 0:
-            return []
+        if len(I) == 0: return []
         
-        # --
+        results = [{
+            "id"  : int(ii),
+            "sim" : float(dd),
+            "emb" : [float(xx) for xx in ee] if return_embs else None, # ?? encode this some other way?  base64?
+            "url" : None,
+        } for dd, ii, ee in zip(D, I, E)]
+                
         # Hydrate w/ metadata
+        metas = self.meta.get(I[:n_meta])
+        for i, meta in enumerate(metas):
+            results[i]['url'] = meta['url']
         
-        # results = self.map_to_metadata(I, D, n_imgs)
-        # return results
-        
-        return [{"index" : int(_index), "distance" : float(_distance)} for _index, _distance in zip(I, D)]
+        return results
         
         
 
 # --
 # Endpoints
 
-# def meta_to_dict(meta):
-#     output = {}
-#     for k, v in meta.items():
-#         if isinstance(v, bytes):
-#             v = v.decode()
-#         elif type(v).__module__ == np.__name__:
-#             v = v.item()
-#         output[k] = v
-    
-#     return output
+class ArrowMetadataProvider:
+    def __init__(self, arrow_folder):
+        arrow_files = [str(a) for a in sorted(Path(arrow_folder).glob("**/*")) if a.is_file()]
+        self.table  = pa.concat_tables([RecordBatchFileReader(pa.memory_map(arrow_file, "r")).read_all() for arrow_file in tqdm(arrow_files)])
 
-# class ArrowMetadataProvider:
-#     """The arrow metadata provider provides metadata from contiguous ids using arrow"""
+    def get(self, ids):
+        t = pa.concat_tables([self.table[i : i + 1] for i in ids])
+        return t.to_pandas().to_dict("records")
 
-#     def __init__(self, arrow_folder):
-#         arrow_files = [str(a) for a in sorted(Path(arrow_folder).glob("**/*")) if a.is_file()]
-#         self.table  = pa.concat_tables([pa.ipc.RecordBatchFileReader(pa.memory_map(arrow_file, "r")).read_all() for arrow_file in arrow_files])
+class HydrateService(Resource):
+    def __init__(self, meta):
+        super().__init__()
+        self.meta = meta
 
-#     def get(self, ids, cols=None):
-#         """implement the get method from the arrow metadata provide, get metadata from ids"""
-#         if cols is None:
-#             cols = self.table.schema.names
-#         else:
-#             cols = list(set(self.table.schema.names) & set(cols))
+    def post(self):
+        req = request.get_json(force=True)
         
-#         t = pa.concat_tables([self.table[i : i + 1] for i in ids])
-#         return t.select(cols).to_pandas().to_dict("records")
-
-# class HydrateService(Resource):
-#     def __init__(self, meta, cols, **kwargs):
-#         super().__init__()
-#         self.meta = meta
-#         self.cols = cols
-
-#     def post(self):
-#         req = request.get_json(force=True)
-#         ids = req["ids"]
-#         if len(ids) == 0:
-#             return []
+        ids = req["ids"]
+        if len(ids) == 0:
+            return []
         
-#         metas = self.meta.get(ids, self.cols)        
-#         return [{"id": item_id, "metadata": meta_to_dict(meta)} for item_id, meta in zip(ids, metas)]
+        metas = self.meta.get(ids)
+        return [{"id": item_id, "metadata": meta} for item_id, meta in zip(ids, metas)]
+
 
 class Health(Resource):
     def get(self):
@@ -264,47 +229,41 @@ def clip_back(index_folder, clip_model):
     clip_model = clip_model.replace('open_clip:', '')
     
     # --
+    # Load metadata
+    
+    print('load_meta     : start')
+    meta = ArrowMetadataProvider(os.path.join(index_folder, "metadata"))
+    print('load_meta     : complete')
+    
+    # --
     # Load CLIP model
     
-    device = "cuda" if torch.cuda.is_available() else "cpu" # Is this right?
+    print('load_open_clip: start')
+    device = "cuda" if torch.cuda.is_available() else "cpu" # Is this right?  I guess we want CUDA if we have it...
     model  = load_open_clip(clip_model, use_jit=True, device=device)
+    print('load_open_clip: complete')
     
     # --
     # Load index
     
+    print('read_index    : start')
     index = faiss.read_index(os.path.join(index_folder, "image.index/populated.index"), faiss.IO_FLAG_ONDISK_SAME_DIR)
-    
-    # --
-    # Load metadata
-
-    # <<
-    # parquet_folder    = index_folder + "/metadata"
-    # mmap_folder       = parquet_folder
-    # meta = ArrowMetadataProvider(mmap_folder)
-    # --
-    meta = None
-    # >>
-    
-    # --
-    # CLIPResource
-    
-    params = dict(
-        model = model,
-        index  = index,
+    print('read_index    : complete')
         
-        meta   = meta,
-        cols   = ["url", "caption"],
-        
-        device = device,
-    )
-
     # --
     # Run App
+
+    params = dict(
+        model  = model,
+        index  = index,
+        meta   = meta,
+        device = device,
+    )
     
     app = Flask(__name__)
     api = Api(app)
     api.add_resource(Health,          "/health")
-    api.add_resource(HydrateService,  "/hydrate",     resource_class_kwargs=params)
+    api.add_resource(HydrateService,  "/hydrate",     resource_class_kwargs={"meta" : meta})
     api.add_resource(KNNService,      "/knn-service", resource_class_kwargs=params)
         
     app.run(host="0.0.0.0", port=1234, debug=False)

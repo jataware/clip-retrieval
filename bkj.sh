@@ -1,4 +1,17 @@
 
+# sudo parted /dev/xvdg
+# mklabel gpt
+# mkpart primary 0% 100%
+# quit
+
+# sudo mkfs.ext4 /dev/xvdg1
+
+# sudo mkdir /data2
+# sudo chown -R ubuntu:ubuntu /data2
+# sudo mount /dev/xvdg1 /data2
+
+# --
+
 wget https://repo.anaconda.com/archive/Anaconda3-2023.07-2-Linux-x86_64.sh
 bash Anaconda3-2023.07-2-Linux-x86_64.sh
 rm Anaconda3-2023.07-2-Linux-x86_64.sh
@@ -24,7 +37,8 @@ pip uninstall clip-retrieval && pip install -e .
 # --
 # Get download URLS
 
-cd data
+# --
+# index
 
 echo "" > _index_urls.txt
 URL="https://huggingface.co/datasets/laion/laion5b-h14-index/resolve/main/index-parts"
@@ -32,6 +46,25 @@ for i in {00..79}; do
     echo "$URL/$i.index"       >> _index_urls.txt
     echo -e "\tout=$i.parquet" >> _index_urls.txt
 done
+
+mkdir -p index-parts && cd index-parts
+aria2c                         \
+    -j8                        \
+    --deferred-input           \
+    --conditional-get=true     \
+    --auto-file-renaming=false \
+    -i ../_index_urls.txt
+cd ..
+
+clip-retrieval index_combiner --input_folder "index-parts" --output_folder "combined-indices"
+mkdir ./Laion5B_H14 && mkdir ./Laion5B_H14/metadata && mkdir ./Laion5B_H14/image.index
+mv combined-indices/* ./Laion5B_H14/image.index/
+rm -rf combined-indices
+# !! rm -rf index-parts !! This is redundant?  Annoying that the DB takes 2x disk to build
+
+# --
+# meta
+
 
 echo "" > _meta_multi.txt
 URL="https://huggingface.co/datasets/laion/laion2b-multi-vit-h-14-embeddings/resolve/main/metadata"
@@ -54,28 +87,9 @@ for i in {0000..1273}; do
     echo "$URL/metadata_$i.parquet" >> _meta_nolang.txt
     echo -e "\tout=$i.parquet"      >> _meta_nolang.txt
 done
+# missing 1273
 
-
-# --
-# index
-
-mkdir -p index-parts && cd index-parts
-aria2c                         \
-    -j8                        \
-    --deferred-input           \
-    --conditional-get=true     \
-    --auto-file-renaming=false \
-    -i ../_index_urls.txt
-cd ..
-
-clip-retrieval index_combiner --input_folder "index-parts" --output_folder "combined-indices"
-mkdir ./Laion5B_H14 && mkdir ./Laion5B_H14/metadata && mkdir ./Laion5B_H14/image.index
-mv combined-indices/* ./Laion5B_H14/image.index/
-rm -rf combined-indices
-# !! rm -rf index-parts !! This is redundant?  Annoying that the DB takes 2x disk to build
-
-# --
-# meta
+# !! Possible missing other data
 
 mkdir -p en-embeddings && cd en-embeddings
 aria2c                         \
@@ -103,6 +117,28 @@ aria2c                         \
     --auto-file-renaming=false \
     -i ../_meta_nolang.txt
 cd ..
+
+
+mkdir -p /data2/scratch/
+
+clip-retrieval parquet_to_arrow \
+    --parquet_folder="data/en-embeddings" \
+    --output_arrow_folder="/data2/scratch/en-combined" \
+    --columns_to_return='["url"]'
+
+clip-retrieval parquet_to_arrow \
+    --parquet_folder="data/multi-embeddings" \
+    --output_arrow_folder="/data2/scratch/multi-combined" \
+    --columns_to_return='["url"]'
+
+clip-retrieval parquet_to_arrow \
+    --parquet_folder="data/nolang-embeddings" \
+    --output_arrow_folder="/data2/scratch/nolang-combined" \
+    --columns_to_return='["url"]'
+
+ln -s /data2/scratch/en-combined/0.arrow data/Laion5B_H14/metadata/0_en.arrow
+ln -s /data2/scratch/multi-combined/0.arrow data/Laion5B_H14/metadata/1_multi.arrow
+ln -s /data2/scratch/nolang-combined/0.arrow data/Laion5B_H14/metadata/2_nolang.arrow
 
 # ?? what to do
 
