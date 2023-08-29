@@ -2,6 +2,11 @@
 
 """
     clip_back.py
+    
+    Dropped:
+        - Safety / violence / aesthetic
+        - Various performance flags that we weren't using
+        - De-duplication
 """
 
 import os
@@ -13,29 +18,85 @@ import urllib
 import numpy as np
 from PIL import Image
 from io import BytesIO
-from dataclasses import dataclass
-from typing import Callable, Any, List
 
 from flask import Flask, request
 from flask_restful import Resource, Api
 
 import faiss
 import torch
+from torch import autocast, nn
+import open_clip
+torch.backends.cuda.matmul.allow_tf32 = True
 
-from clip_retrieval.load_clip import load_clip, get_tokenizer
+# --
+# Model
 
-class Health(Resource):
-    def get(self):
-        return "OK!"
+class OpenClipWrapper(nn.Module):
+    def __init__(self, model, preprocess, tokenizer, device):
+        super().__init__()
+        self.model      = model
+        self.preprocess = preprocess
+        self.tokenizer  = tokenizer
+        self.device     = torch.device(device=device)
+        
+        if self.device.type == "cpu":
+            self.dtype = torch.float32
+        else:
+            self.dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
+    def encode_image(self, image):
+        if self.device.type == "cpu":
+            return self.model.encode_image(image)
+        
+        with autocast(device_type=self.device.type, dtype=self.dtype):
+            return self.model.encode_image(image)
+
+    def encode_text(self, text):
+        if self.device.type == "cpu":
+            return self.model.encode_text(text)
+        
+        with autocast(device_type=self.device.type, dtype=self.dtype):
+            return self.model.encode_text(text)
+
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+
+def _warmup(model, warmup_batch_size, device):
+    fake_img     = Image.new("RGB", (224, 224), color="red")
+    fake_text    = ["fake"] * warmup_batch_size
+    image_tensor = torch.cat([torch.unsqueeze(model.preprocess(fake_img), 0)] * warmup_batch_size).to(device)
+    text_tokens  = model.tokenizer(fake_text).to(device)
+    for _ in range(2):
+        with torch.no_grad():
+            model.encode_image(image_tensor)
+            model.encode_text(text_tokens)
+
+
+def load_open_clip(clip_model, use_jit=True, warmup_batch_size=1, clip_cache_path=None, device=None):
+    clip_model
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    tokenizer = open_clip.get_tokenizer(clip_model)
+    
+    pretrained           = dict(open_clip.list_pretrained())
+    checkpoint           = pretrained[clip_model]
+    model, _, preprocess = open_clip.create_model_and_transforms(clip_model, pretrained=checkpoint, device=device, jit=use_jit, cache_dir=clip_cache_path)
+    model                = OpenClipWrapper(model, preprocess, tokenizer, device=device)
+    model                = model.to(device=device)
+    
+    
+    _warmup(model, warmup_batch_size, device)
+    return model
+
+
+# --
+# Helpers
 
 def download_image(url):
-    """Download an image from a url and return a byte stream"""
-    urllib_request = urllib.request.Request(
-        url,
-        data=None,
-        headers={"User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:72.0) Gecko/20100101 Firefox/72.0"},
-    )
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:72.0) Gecko/20100101 Firefox/72.0"}
+    urllib_request = urllib.request.Request(url, data=None, headers=headers,)
     urllib_context = ssl.create_default_context()
     urllib_context.set_alpn_protocols(["http/1.1"])
 
@@ -45,59 +106,62 @@ def download_image(url):
     return img_stream
 
 
-# class MetadataService(Resource):
-#     def __init__(self, clip_resource):
-#         super().__init__()
-#         self.clip_resource = clip_resource
+# def meta_to_dict(meta):
+#     output = {}
+#     for k, v in meta.items():
+#         if isinstance(v, bytes):
+#             v = v.decode()
+#         elif type(v).__module__ == np.__name__:
+#             v = v.item()
+#         output[k] = v
+    
+#     return output
 
-#     def post(self):
-#         json_data = request.get_json(force=True)
-#         ids       = json_data["ids"]
-#         if len(ids) == 0:
-#             return []
+
+# class ArrowMetadataProvider:
+#     """The arrow metadata provider provides metadata from contiguous ids using arrow"""
+
+#     def __init__(self, arrow_folder):
+#         arrow_files = [str(a) for a in sorted(Path(arrow_folder).glob("**/*")) if a.is_file()]
+#         self.table  = pa.concat_tables([pa.ipc.RecordBatchFileReader(pa.memory_map(arrow_file, "r")).read_all() for arrow_file in arrow_files])
+
+#     def get(self, ids, cols=None):
+#         """implement the get method from the arrow metadata provide, get metadata from ids"""
+#         if cols is None:
+#             cols = self.table.schema.names
+#         else:
+#             cols = list(set(self.table.schema.names) & set(cols))
         
-#         metadata_provider  = self.metadata_provider
-#         metas              = metadata_provider.get(ids, self.columns_to_return)        
-#         return [{"id": item_id, "metadata": meta_to_dict(meta)} for item_id, meta in zip(ids, metas)]
+#         t = pa.concat_tables([self.table[i : i + 1] for i in ids])
+#         return t.select(cols).to_pandas().to_dict("records")
 
-
-def normalized(a, axis=-1, order=2):
-    l2 = np.atleast_1d(np.linalg.norm(a, order, axis))
-    l2[l2 == 0] = 1
-    return a / np.expand_dims(l2, axis)
-
+# --
+# Endpoints
 
 class KNNService(Resource):
     """the knn service provides nearest neighbors given text or image"""
 
-    def __init__(self, 
-        device,
-        model,
-        preprocess,
-        tokenizer,
-        metadata_provider,
-        index,
-        columns_to_return,
-    ):
+    def __init__(self, model, index, meta, cols, device):
         super().__init__()
 
-        self.device             = device
-        self.model              = model
-        self.preprocess         = preprocess
-        self.tokenizer          = tokenizer
-        self.metadata_provider  = metadata_provider
-        self.index              = index
-        self.columns_to_return  = columns_to_return
+        self.model = model
+        self.index = index
+        
+        self.meta  = meta
+        self.cols  = cols
+        
+        
+        self.device = device
     
-    # def map_to_metadata(self, indices, distances, n_imgs, metadata_provider, columns_to_return):
+    # def map_to_metadata(self, indices, distances, n_imgs):
 
     #     results = []
-    #     metas   = metadata_provider.get(indices[:n_imgs], columns_to_return)
+    #     metas   = self.meta.get(indices[:n_imgs], self.cols)
         
     #     for key, (d, i) in enumerate(zip(distances, indices)):
     #         output = {}
     #         meta   = None if key + 1 > len(metas) else metas[key]
-    #         convert_metadata_to_base64(meta)
+    
     #         if meta is not None:
     #             output.update(meta_to_dict(meta))
             
@@ -116,15 +180,15 @@ class KNNService(Resource):
         # Compute query
         
         if q_text is not None and q_text != "":
-            inp = self.tokenizer([q_text]).to(self.device)
+            inp = self.model.tokenizer([q_text]).to(self.device)
             q   = self.model.encode_text(inp)
             q  /= q.norm(dim=-1, keepdim=True)
             q   = q.cpu().to(torch.float32).detach().numpy()
         
         elif q_img is not None:
             inp = Image.open(q_img)
-            inp = self.preprocess(inp).unsqueeze(0).to(self.device)
-            q  = self.model.encode_image(inp)
+            inp = self.model.preprocess(inp).unsqueeze(0).to(self.device)
+            q   = self.model.encode_image(inp)
             q /= q.norm(dim=-1, keepdim=True)
             q  = q.cpu().to(torch.float32).detach().numpy()
         
@@ -140,8 +204,11 @@ class KNNService(Resource):
         # drop missing entries
         sel     = I != -1
         D, I, E = D[sel], I[sel], E[sel]
-        
-        # !! deduplicate?
+
+        # --
+        # Post-filter
+                
+        # !! deduplicate? (if so, remember to normalize E)
         # !! safety filters, etc?
         
         if len(D) == 0:
@@ -150,7 +217,7 @@ class KNNService(Resource):
         # --
         # Hydrate w/ metadata
         
-        # results = self.map_to_metadata(I, D, n_imgs, self.metadata_provider, self.columns_to_return)
+        # results = self.map_to_metadata(I, D, n_imgs)
         # return results
         
         return [{"index" : int(_index), "distance" : float(_distance)} for _index, _distance in zip(I, D)]
@@ -177,103 +244,66 @@ class KNNService(Resource):
             n_mids = req.get("n_mids", None),
         )
 
+# --
+# Endpoints
 
+# class HydrateService(Resource):
+#     def __init__(self, clip_resource):
+#         super().__init__()
+#         self.clip_resource = clip_resource
 
-def load_index(path, enable_faiss_memory_mapping):
-    if enable_faiss_memory_mapping:
-        if os.path.isdir(path):
-            return faiss.read_index(path + "/populated.index", faiss.IO_FLAG_ONDISK_SAME_DIR)
-        else:
-            return faiss.read_index(path, faiss.IO_FLAG_MMAP | faiss.IO_FLAG_READ_ONLY)
-    
-    else:
-        return faiss.read_index(path)
-
-
-
-# def meta_to_dict(meta):
-#     output = {}
-#     for k, v in meta.items():
-#         if isinstance(v, bytes):
-#             v = v.decode()
-#         elif type(v).__module__ == np.__name__:
-#             v = v.item()
-#         output[k] = v
-    
-#     return output
-
-# class ArrowMetadataProvider:
-#     """The arrow metadata provider provides metadata from contiguous ids using arrow"""
-
-#     def __init__(self, arrow_folder):
-#         arrow_files = [str(a) for a in sorted(Path(arrow_folder).glob("**/*")) if a.is_file()]
-#         self.table  = pa.concat_tables([pa.ipc.RecordBatchFileReader(pa.memory_map(arrow_file, "r")).read_all() for arrow_file in arrow_files])
-
-#     def get(self, ids, cols=None):
-#         """implement the get method from the arrow metadata provide, get metadata from ids"""
-#         if cols is None:
-#             cols = self.table.schema.names
-#         else:
-#             cols = list(set(self.table.schema.names) & set(cols))
+#     def post(self):
+#         json_data = request.get_json(force=True)
+#         ids       = json_data["ids"]
+#         if len(ids) == 0:
+#             return []
         
-#         t = pa.concat_tables([self.table[i : i + 1] for i in ids])
-#         return t.select(cols).to_pandas().to_dict("records")
+#         meta  = self.meta
+#         metas              = meta.get(ids, self.cols)        
+#         return [{"id": item_id, "metadata": meta_to_dict(meta)} for item_id, meta in zip(ids, metas)]
+
+class Health(Resource):
+    def get(self):
+        return "OK!"
 
 
-# def load_metadata_provider(
-#     index_folder, index, columns_to_return, use_arrow
-# ):
-#     """load the metadata provider"""
-#     parquet_folder    = index_folder + "/metadata"
-#     mmap_folder       = parquet_folder
-#     metadata_provider = ArrowMetadataProvider(mmap_folder)
-    
-#     return metadata_provider
-
-
-
-def clip_back(
-    index_folder,
-    clip_model,
-    
-    columns_to_return              = ["url", "caption"],
-    
-    use_jit                        = True,
-    enable_faiss_memory_mapping    = True,
-    use_arrow                      = True,
-    
-    port                           = 1234,
-):
+def clip_back(index_folder, clip_model):
+    assert 'open_clip:' in clip_model
+    clip_model = clip_model.replace('open_clip:', '')
     
     # --
     # Load CLIP model
     
-    device            = "cuda" if torch.cuda.is_available() else "cpu"
-    model, preprocess = load_clip(clip_model, use_jit=use_jit, device=device)
-    tokenizer         = get_tokenizer(clip_model)
-    index             = load_index(index_folder + "/image.index", enable_faiss_memory_mapping)
-
+    device = "cuda" if torch.cuda.is_available() else "cpu" # Is this right?
+    model  = load_open_clip(clip_model, use_jit=True, device=device)
+    
     # --
     # Load index
     
-    metadata_provider = None # load_metadata_provider(
-    #     index_folder,
-    #     index,
-    #     columns_to_return,
-    #     use_arrow,
-    # )
+    index = faiss.read_index(os.path.join(index_folder, "image.index/populated.index"), faiss.IO_FLAG_ONDISK_SAME_DIR)
+    
+    # --
+    # Load metadata
+
+    # <<
+    # parquet_folder    = index_folder + "/metadata"
+    # mmap_folder       = parquet_folder
+    # meta = ArrowMetadataProvider(mmap_folder)
+    # --
+    meta = None
+    # >>
     
     # --
     # CLIPResource
     
     params = dict(
-        device            = device,
-        model             = model,
-        preprocess        = preprocess,
-        tokenizer         = tokenizer,
-        metadata_provider = metadata_provider,
-        index             = index,
-        columns_to_return = columns_to_return,
+        model = model,
+        index  = index,
+        
+        meta   = meta,
+        cols   = ["url", "caption"],
+        
+        device = device,
     )
 
     # --
@@ -282,11 +312,10 @@ def clip_back(
     app = Flask(__name__)
     api = Api(app)
     api.add_resource(Health,          "/health")
-    # api.add_resource(MetadataService, "/metadata",     resource_class_kwargs={"clip_resource" : clip_resource})
+    # api.add_resource(HydrateService, "/hydrate",     resource_class_kwargs={"clip_resource" : clip_resource})
     api.add_resource(KNNService,      "/knn-service",  resource_class_kwargs=params)
         
-    app.run(host="0.0.0.0", port=port, debug=False)
-
+    app.run(host="0.0.0.0", port=1234, debug=False)
 
 if __name__ == "__main__":
-    fire.Fire(clip_back)
+    fire.Fire(_run)

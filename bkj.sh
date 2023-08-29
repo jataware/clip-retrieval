@@ -57,7 +57,7 @@ done
 
 
 # --
-# indedx
+# index
 
 mkdir -p index-parts && cd index-parts
 aria2c                         \
@@ -69,7 +69,13 @@ aria2c                         \
 cd ..
 
 clip-retrieval index_combiner --input_folder "index-parts" --output_folder "combined-indices"
+mkdir ./Laion5B_H14 && mkdir ./Laion5B_H14/metadata && mkdir ./Laion5B_H14/image.index
+mv combined-indices/* ./Laion5B_H14/image.index/
+rm -rf combined-indices
+# !! rm -rf index-parts !! This is redundant?  Annoying that the DB takes 2x disk to build
 
+# --
+# meta
 
 mkdir -p en-embeddings && cd en-embeddings
 aria2c                         \
@@ -98,10 +104,10 @@ aria2c                         \
     -i ../_meta_nolang.txt
 cd ..
 
-# --
+# ?? what to do
 
-mkdir ./Laion5B_H14 && mkdir ./Laion5B_H14/metadata && mkdir ./Laion5B_H14/image.index
-mv combined-indices/* ./Laion5B_H14/image.index/
+# --
+# Run
 
 clip-retrieval back --index_folder data/Laion5B_H14 --clip_model open_clip:ViT-H-14
 
