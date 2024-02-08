@@ -1,3 +1,9 @@
+*.tif
+*.png
+*.npy
+_imgs/*
+_urls.txt
+
 data
 .env
 *.egg-info

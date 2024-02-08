@@ -25,6 +25,7 @@ from io import BytesIO
 from pathlib import Path
 
 from flask import Flask, request
+from flask_cors import CORS
 from flask_restful import Resource, Api
 
 import faiss
@@ -126,6 +127,7 @@ class KNNService(Resource):
         self.device = device
 
     def post(self):
+        print('KNNService.post: start')
         req = request.get_json(force=True)
         
         # --
@@ -163,8 +165,10 @@ class KNNService(Resource):
             q = np.array(q_emb).astype(np.float32)[None]
         
         # do search
+        print('\tKNNService.post.search_and_reconstruct: start')
         D, I, E = self.index.search_and_reconstruct(q, n_imgs) # !! could run multiple at a time
         D, I, E = D[0], I[0], E[0]
+        print('\tKNNService.post.search_and_reconstruct: complete')
         
         # drop missing entries
         sel     = I != -1
@@ -187,6 +191,9 @@ class KNNService(Resource):
         for i, meta in enumerate(metas):
             results[i]['url'] = meta['url']
         
+        # !! Should drop duplicate URLs, I think
+        
+        print('KNNService.post: complete')
         return results
         
         
@@ -231,24 +238,24 @@ def clip_back(index_folder, clip_model):
     # --
     # Load metadata
     
-    print('load_meta     : start')
+    print('load_meta      : start')
     meta = ArrowMetadataProvider(os.path.join(index_folder, "metadata"))
     print('load_meta     : complete')
     
     # --
     # Load CLIP model
     
-    print('load_open_clip: start')
+    print('load_open_clip : start')
     device = "cuda" if torch.cuda.is_available() else "cpu" # Is this right?  I guess we want CUDA if we have it...
     model  = load_open_clip(clip_model, use_jit=True, device=device)
-    print('load_open_clip: complete')
+    print('load_open_clip : complete')
     
     # --
     # Load index
     
-    print('read_index    : start')
+    print('read_index     : start')
     index = faiss.read_index(os.path.join(index_folder, "image.index/populated.index"), faiss.IO_FLAG_ONDISK_SAME_DIR)
-    print('read_index    : complete')
+    print('read_index     : complete')
         
     # --
     # Run App
@@ -265,7 +272,8 @@ def clip_back(index_folder, clip_model):
     api.add_resource(Health,          "/health")
     api.add_resource(HydrateService,  "/hydrate",     resource_class_kwargs={"meta" : meta})
     api.add_resource(KNNService,      "/knn-service", resource_class_kwargs=params)
-        
+    CORS(app)
+    
     app.run(host="0.0.0.0", port=1234, debug=False)
 
 if __name__ == "__main__":

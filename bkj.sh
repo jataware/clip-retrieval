@@ -91,31 +91,19 @@ done
 
 # !! Possible missing other data
 
-mkdir -p en-embeddings && cd en-embeddings
-aria2c                         \
-    -j8                        \
-    --deferred-input           \
-    --conditional-get=true     \
-    --auto-file-renaming=false \
-    -i ../_meta_en.txt
+mkdir -p en-embeddings
+cd en-embeddings
+aria2c -j8 --deferred-input --conditional-get=true --auto-file-renaming=false -i ../_meta_en.txt
 cd ..
 
-mkdir -p multi-embeddings && cd multi-embeddings
-aria2c                         \
-    -j8                        \
-    --deferred-input           \
-    --conditional-get=true     \
-    --auto-file-renaming=false \
-    -i ../_meta_multi.txt
+mkdir -p multi-embeddings
+cd multi-embeddings
+aria2c -j8 --deferred-input --conditional-get=true --auto-file-renaming=false -i ../_meta_multi.txt
 cd ..
 
-mkdir -p nolang-embeddings && cd nolang-embeddings
-aria2c                         \
-    -j8                        \
-    --deferred-input           \
-    --conditional-get=true     \
-    --auto-file-renaming=false \
-    -i ../_meta_nolang.txt
+mkdir -p nolang-embeddings
+cd nolang-embeddings
+aria2c -j8 --deferred-input --conditional-get=true --auto-file-renaming=false -i ../_meta_nolang.txt
 cd ..
 
 
@@ -136,9 +124,12 @@ clip-retrieval parquet_to_arrow \
     --output_arrow_folder="/data2/scratch/nolang-combined" \
     --columns_to_return='["url"]'
 
-ln -s /data2/scratch/en-combined/0.arrow data/Laion5B_H14/metadata/0_en.arrow
-ln -s /data2/scratch/multi-combined/0.arrow data/Laion5B_H14/metadata/1_multi.arrow
-ln -s /data2/scratch/nolang-combined/0.arrow data/Laion5B_H14/metadata/2_nolang.arrow
+rm -r data/en-embeddings data/multi-embeddings data/nolang-embeddings
+mv /data2/scratch/* ./data/
+
+mv data/en-combined/0.arrow     data/Laion5B_H14/metadata/0_en.arrow
+mv data/multi-combined/0.arrow  data/Laion5B_H14/metadata/1_multi.arrow
+mv data/nolang-combined/0.arrow data/Laion5B_H14/metadata/2_nolang.arrow
 
 # ?? what to do
 
@@ -147,4 +138,14 @@ ln -s /data2/scratch/nolang-combined/0.arrow data/Laion5B_H14/metadata/2_nolang.
 
 clip-retrieval back --index_folder data/Laion5B_H14 --clip_model open_clip:ViT-H-14
 
-curl -XPOST http://0.0.0.0:1234/knn-service -H 'Content-Type: application/json' -d '{"text" : "cat", "n_imgs" : 10}'
+curl -XPOST http://0.0.0.0:1234/knn-service -H 'Content-Type: application/json' -d '{"text" : "a picture of a cat", "n_imgs" : 10}' | jq .
+curl -XPOST http://0.0.0.0:1234/knn-service -H 'Content-Type: application/json' -d '{"text" : "a picture of a cat", "n_imgs" : 5, "n_mids" : 10}' | jq .
+curl -XPOST http://0.0.0.0:1234/knn-service -H 'Content-Type: application/json' -d '{"text" : "a picture of a cat", "n_imgs" : 5, "n_mids" : 10, "return_embs" : true}'
+
+# --
+
+# !! What's next?
+#   - Better UI (w/ annotation?)
+#   - Huge TSNE viewer (w/ annotation?)
+#   - How can we measure precision and recall here?  w/ sampling?
+#   - ... ultimate goal: "build-a-classifier" ... 
