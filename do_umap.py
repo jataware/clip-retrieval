@@ -1,11 +1,17 @@
+#!/usr/bin/env python
+
+"""
+    do_umap.py
+"""
+
+import os
 import requests
 import numpy as np
 import pandas as pd
-from tifffile import imwrite as tiffwrite
-
-import os
 from PIL import Image
+from glob import glob
 from tqdm import tqdm
+from tifffile import imwrite as tiffwrite
 
 # --
 # Helpers
@@ -25,9 +31,9 @@ df   = df.reset_index(drop=True)
 with open('_urls.txt', 'w') as f:
     print('\n'.join(df.url), file=f)
 
-# ...  img2dataset     --url_list                _urls.txt     --output_folder           _imgs     --thread_count            64     --image_size              256     --resize_only_if_bigger   True     --resize_mode             keep_ratio_largest
+# ...  img2dataset --url_list _urls.txt --output_folder _imgs --thread_count 64 --image_size 256 --resize_only_if_bigger True --resize_mode keep_ratio_largest
 
-dl_meta = pd.read_parquet('_imgs/00000.parquet').sort_values('key')
+dl_meta = pd.concat([pd.read_parquet(fname) for fname in sorted(glob('_imgs/*.parquet'))]).sort_values('key')
 dl_meta = dl_meta[['url', 'status', 'key']]
 df      = pd.merge(df, dl_meta, how='left')
 df      = df[df.status == 'success']
@@ -68,7 +74,8 @@ for r, c, key in tqdm(zip(df._r, df._c, df.key), total=df.shape[0]):
 
 tiffwrite('tmp.tif', out)
 
-# gdal_translate -of COG tmp.tif cog.tif
+# ... gdal_translate -of COG tmp.tif cog.tif
+
 # ... annotations through the app ...
 
 labs       = np.load('labels.npy')
